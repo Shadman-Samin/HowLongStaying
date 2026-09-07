@@ -55,7 +55,21 @@ Notes:
 - `src/tracker.js` — 1s tick + 5s heartbeat, only when tab active. Idle detection 60s.
 - `src/main.js` — join flow (nickname → userId in localStorage), timer UI, polling.
 - `src/leaderboard.js` — live top-50 render, online dots.
-- `server/index.js` — Express API: `GET /api/challenge`, `POST /api/join`, `POST /api/tick` (=heartbeat), `POST /api/rename` (4 per 24h, stats preserved), `POST /api/resume`, `POST /api/leave`, `GET /api/leaderboard`, `GET /api/me`.
+- `server/index.js` — Express API: `GET /api/challenge`, `POST /api/join`, `POST /api/tick` (=heartbeat), `POST /api/rename` (4 per 24h, stats preserved), `POST /api/resume`, `POST /api/leave`, `GET /api/leaderboard`, `GET /api/me`, `DELETE /api/me` (GDPR purge).
+
+## Auth model
+
+- `POST /api/join` (new + rejoin, both need a fresh `nonce`) returns a
+  `sessionToken = HMAC(SECRET, userId.sessionId)`. Every mutating/read-own
+  call (`tick`, `rename`, `resume`, `leave`, `me`) must present it —
+  knowledge of `userId` alone gets `401 BAD_TOKEN`.
+- Leaderboard exposes only `publicId` (truncated hash); raw ids never leave
+  the server, so enumeration can't hijack accounts.
+- Admin: `GET /api/admin/flags` with header `x-admin-token` ONLY
+  (`?token=` is rejected — query strings leak into logs).
+- Env: `ADMIN_TOKEN` (required in production/Vercel — boot throws without
+  it), `SESSION_SECRET` (optional, defaults to `ADMIN_TOKEN`),
+  `UPSTASH_REDIS_REST_URL/TOKEN` (or Vercel `KV_REST_API_*` aliases).
 - `server/db.js` — JSON file store (`server/data/db.json`). Swap for SQLite/Postgres later.
 ## Anti-cheat (Tier A+B)
 
@@ -70,7 +84,13 @@ Client `deltaMs` is **ignored** — the server computes time from its own clock.
 | 100 nicknames, 1 person | Max 5 nicks/IP/day + max 3 accounts/device fingerprint |
 | 24/7 bot | 16h/day hard cap + 4h session cap (human click to resume) |
 | Tab hidden / minimized / AFK | Client pauses (visibility + focus + 60s idle); server logs attestation |
+| Spoofed `vis/focus/idleMs` | Server REJECTS self-admitted inactive ticks (`409 ATTEST`, no credit) |
+| Stolen/enumerated `userId` | HMAC session tokens required; leaderboard shows `publicId` only |
+| Race double-credit / dup nick | Atomic Lua ops (tick/rename/create/IP window) on Redis; single critical section on JSON |
+| Spoofed `X-Forwarded-For` | `trust proxy` + `req.ip`; strict UUID/integer/limit validation; `__proto__` keys rejected |
 
+- Rate limits: global 1000/15min + `challenge` 30/10min, `join` 60/10min, `rename` 30/10min, `admin` 60/10min (per IP). Bodies capped at 10kb.
+- Headers: helmet CSP + `X-Frame-Options DENY` + HSTS + nosniff (also in `vercel.json` for CDN static). CORS allowlist: production domain + localhost dev only.
 - Audit trail: `server/data/audit.log.ndjson` (all ticks + rejects).
 - Review flags: `GET /api/admin/flags?token=$ADMIN_TOKEN` (set `ADMIN_TOKEN` env in prod).
 - Flow: `GET /api/challenge` → `POST /api/join {nickname, fp, nonce}` → `POST /api/tick {userId, sessionId, seq, ...}` every 5s → `POST /api/resume` after session cap.

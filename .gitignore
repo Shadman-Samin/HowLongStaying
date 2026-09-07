@@ -1,5 +1,10 @@
 node_modules/
 dist/
 server/data/db.json
-server/data/audit*.ndjson
+server/data/audit.log.ndjson*
 *.log
+.env
+.env.*
+!.env.example
+.vercel
+coverage/

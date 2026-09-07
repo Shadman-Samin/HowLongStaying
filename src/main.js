@@ -50,11 +50,39 @@ let fpPromise = fingerprint().catch(() => null)
 
 let userId = localStorage.getItem('hls_userId') || null
 let nickname = localStorage.getItem('hls_nickname') || null
+let sessionToken = localStorage.getItem('hls_sessionToken') || null
+let myPublicId = null
 let sessionId = null
 let seq = 0
 let rank = null
 let sessionCapped = false
 let renameMode = false
+
+function clearIdentity() {
+  localStorage.removeItem('hls_userId')
+  localStorage.removeItem('hls_nickname')
+  localStorage.removeItem('hls_sessionToken')
+  userId = null
+  nickname = null
+  sessionToken = null
+  myPublicId = null
+  sessionId = null
+  seq = 0
+  rank = null
+}
+
+/** Pull own record (publicId, rank, quota) — called after join/rejoin/boot. */
+async function syncMe() {
+  if (!userId || !sessionToken) return
+  const me = await api.get(`/api/me?userId=${encodeURIComponent(userId)}&sessionToken=${encodeURIComponent(sessionToken)}`)
+  myPublicId = me.publicId
+  nickname = me.nickname
+  localStorage.setItem('hls_nickname', nickname)
+  tracker.setTotalMs(me.totalMs)
+  rank = me.rank
+  rankLabel.textContent = `Rank: #${rank ?? '—'}`
+  return me
+}
 
 const tracker = new Tracker({
   onTick: ({ totalMs, sessionMs, active }) => {
@@ -65,7 +93,7 @@ const tracker = new Tracker({
   },
   onStatusChange: status => { if (!sessionCapped) updateStatusUI(status.active, status.reason) },
   onHeartbeat: async () => {
-    if (!userId || !sessionId || sessionCapped) return
+    if (!userId || !sessionId || !sessionToken || sessionCapped) return
     seq += 1
     const mySeq = seq
     try {
@@ -73,6 +101,7 @@ const tracker = new Tracker({
       const data = await api.post('/api/tick', {
         userId,
         sessionId,
+        sessionToken,
         seq: mySeq,
         fp: await fpPromise,
         vis: document.visibilityState,
@@ -80,8 +109,7 @@ const tracker = new Tracker({
         idleMs: tracker.getIdleMs()
       })
       tracker.setTotalMs(data.totalMs)
-      rank = data.rank
-      rankLabel.textContent = `Rank: #${rank ?? '—'}`
+      // rank comes from the 5s board poll (tick responses carry no rank — DoS guard)
       if (data.capped) {
         meRow.textContent = `Daily cap reached (16h) — see you tomorrow 🌙 · total ${formatDurationLong(data.totalMs)}`
         meRow.classList.remove('hidden')
@@ -90,16 +118,15 @@ const tracker = new Tracker({
       }
       hideWarn()
     } catch (e) {
-      if (e.code === 'REPLAY' || e.code === 'UNKNOWN_USER') {
-        // seq desync or unknown — rejoin to rotate session + resync
+      if (e.code === 'REPLAY' || e.code === 'UNKNOWN_USER' || e.code === 'BAD_TOKEN') {
+        // seq desync, unknown account, or rotated/invalid token — rejoin to resync
         await rejoin()
       } else if (e.code === 'CONCURRENT') {
         showWarn('⚠️ ' + e.message)
       } else if (e.code === 'SESSION_CAP') {
         enterSessionCap(e.data?.totalMs)
       }
-      // TOO_FAST / IP_FLOOD: just skip, next tick retries
-      seq = Math.max(seq, e.data?.lastSeq ?? seq)
+      // TOO_FAST / IP_FLOOD / ATTEST: just skip, next tick retries
     }
   }
 })
@@ -151,8 +178,10 @@ resumeBtn.addEventListener('click', async () => {
   resumeBtn.textContent = 'checking…'
   try {
     const { nonce } = await api.get('/api/challenge')
-    const data = await api.post('/api/resume', { userId, nonce })
+    const data = await api.post('/api/resume', { userId, sessionToken, nonce })
     sessionId = data.sessionId
+    sessionToken = data.sessionToken
+    localStorage.setItem('hls_sessionToken', sessionToken)
     seq = data.seqStart || 0
     sessionCapped = false
     resumeBox.classList.add('hidden')
@@ -190,9 +219,9 @@ function fmtResetIn(resetAtMs) {
 }
 
 async function refreshRenameHint() {
-  if (!userId) return
+  if (!userId || !sessionToken) return
   try {
-    const me = await api.get('/api/me?userId=' + encodeURIComponent(userId))
+    const me = await api.get(`/api/me?userId=${encodeURIComponent(userId)}&sessionToken=${encodeURIComponent(sessionToken)}`)
     const n = me.renameRemaining ?? 4
     renameHint.textContent = `${n} name change${n === 1 ? '' : 's'} left per 24h · ${fmtResetIn(me.renameResetAtMs)}`
     renameHint.classList.remove('hidden')
@@ -224,12 +253,12 @@ function cancelRename() {
 async function refreshBoard() {
   try {
     const data = await api.get('/api/leaderboard?limit=50')
-    renderBoard(boardEl, data.leaders, userId)
+    renderBoard(boardEl, data.leaders, myPublicId)
     highlightSharedNick()
     const online = data.leaders.filter(l => l.online).length
     onlineCount.textContent = online ? `${online} online now` : ''
-    if (userId) {
-      const idx = data.leaders.findIndex(l => l.id === userId)
+    if (myPublicId) {
+      const idx = data.leaders.findIndex(l => l.publicId === myPublicId)
       if (idx >= 0) {
         rank = idx + 1
         rankLabel.textContent = `Rank: #${rank}`
@@ -262,17 +291,17 @@ function highlightSharedNick() {
 async function rejoin() {
   if (!userId) return
   try {
-    const data = await api.post('/api/join', { nickname: '', userId, fp: await fpPromise })
+    const { nonce } = await api.get('/api/challenge')
+    const data = await api.post('/api/join', { nickname: '', userId, fp: await fpPromise, nonce })
     sessionId = data.sessionId
+    sessionToken = data.sessionToken
+    localStorage.setItem('hls_sessionToken', sessionToken)
     seq = data.seqStart || 0
-    tracker.setTotalMs(data.totalMs)
-    rank = data.rank
-    rankLabel.textContent = `Rank: #${rank ?? '—'}`
+    await syncMe()
     hideWarn()
   } catch {
-    localStorage.removeItem('hls_userId')
-    userId = null
-    sessionId = null
+    clearIdentity()
+    sessionCapped = false
     showJoin()
   }
 }
@@ -290,7 +319,7 @@ joinForm.addEventListener('submit', async e => {
   if (renameMode && userId) {
     try {
       const { nonce } = await api.get('/api/challenge')
-      const data = await api.post('/api/rename', { userId, newNickname: name, fp: await fpPromise, nonce })
+      const data = await api.post('/api/rename', { userId, sessionToken, newNickname: name, fp: await fpPromise, nonce })
       nickname = data.nickname
       localStorage.setItem('hls_nickname', nickname)
       showPlaying()
@@ -319,12 +348,12 @@ joinForm.addEventListener('submit', async e => {
     userId = data.userId
     nickname = data.nickname
     sessionId = data.sessionId
+    sessionToken = data.sessionToken
     seq = data.seqStart || 0
     localStorage.setItem('hls_userId', userId)
     localStorage.setItem('hls_nickname', nickname)
-    tracker.setTotalMs(data.totalMs)
-    rank = data.rank
-    rankLabel.textContent = `Rank: #${rank ?? '—'}`
+    localStorage.setItem('hls_sessionToken', sessionToken)
+    await syncMe()
     showPlaying()
     updateStatusUI(true)
     refreshBoard()
@@ -358,9 +387,9 @@ shareBtn.addEventListener('click', async () => {
 
 // beacon on close — server just marks seen
 window.addEventListener('pagehide', () => {
-  if (!userId) return
+  if (!userId || !sessionToken) return
   try {
-    navigator.sendBeacon('/api/leave', JSON.stringify({ userId }))
+    navigator.sendBeacon('/api/leave', JSON.stringify({ userId, sessionToken }))
   } catch { /* ignore */ }
 })
 
@@ -369,23 +398,22 @@ async function boot() {
   refreshBoard()
   setInterval(refreshBoard, 5000)
 
-  if (userId) {
+  if (userId && sessionToken) {
     try {
-      const data = await api.post('/api/join', { nickname: '', userId, fp: await fpPromise })
-      nickname = data.nickname
+      const { nonce } = await api.get('/api/challenge')
+      const data = await api.post('/api/join', { nickname: '', userId, fp: await fpPromise, nonce })
       sessionId = data.sessionId
+      sessionToken = data.sessionToken
+      localStorage.setItem('hls_sessionToken', sessionToken)
       seq = data.seqStart || 0
-      localStorage.setItem('hls_nickname', nickname)
-      tracker.setTotalMs(data.totalMs)
-      rank = data.rank
-      rankLabel.textContent = `Rank: #${rank ?? '—'}`
+      await syncMe()
       showPlaying()
     } catch {
-      localStorage.removeItem('hls_userId')
-      userId = null
+      clearIdentity()
       showJoin()
     }
   } else {
+    if (userId && !sessionToken) clearIdentity() // stale pre-token identity — start clean
     showJoin()
   }
   tracker.start(tracker.totalMs)

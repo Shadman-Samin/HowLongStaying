@@ -7,24 +7,38 @@ const DATA_DIR = join(__dirname, 'data')
 const DB_FILE = join(DATA_DIR, 'db.json')
 const AUDIT_FILE = join(DATA_DIR, 'audit.log.ndjson')
 
-import { RENAME_LIMIT, RENAME_WINDOW_MS, AUDIT_MAX_BYTES } from './config.js'
+import { RENAME_LIMIT, RENAME_WINDOW_MS, AUDIT_MAX_BYTES, publicIdFor } from './config.js'
 
 if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true })
+
+/** Prototype-pollution guard: never use magic keys as user ids. */
+const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
+export function isSafeKey(id) {
+  return typeof id === 'string' && id.length > 0 && id.length <= 64 && !UNSAFE_KEYS.has(id)
+}
 
 export function todayStr(d = new Date()) {
   return d.toISOString().slice(0, 10) // UTC YYYY-MM-DD
 }
 
+/** Null-prototype user map so crafted ids can never touch Object.prototype. */
+function safeUsers(db) {
+  db.users = Object.assign(Object.create(null), db.users || {})
+  return db.users
+}
+
 function load() {
   try {
     if (!existsSync(DB_FILE)) {
-      const fresh = { users: {} }
+      const fresh = { users: Object.create(null) }
       writeFileSync(DB_FILE, JSON.stringify(fresh, null, 2))
       return fresh
     }
-    return JSON.parse(readFileSync(DB_FILE, 'utf-8'))
+    const db = JSON.parse(readFileSync(DB_FILE, 'utf-8'))
+    safeUsers(db)
+    return db
   } catch {
-    return { users: {} }
+    return { users: Object.create(null) }
   }
 }
 
@@ -71,6 +85,7 @@ function migrate(u) {
 }
 
 function withUser(id, fn) {
+  if (!isSafeKey(id)) return null
   const db = load()
   const raw = db.users[id]
   if (!raw) return null
@@ -81,6 +96,7 @@ function withUser(id, fn) {
 }
 
 export function getUserById(id) {
+  if (!isSafeKey(id)) return null
   const db = load()
   const raw = db.users[id]
   if (!raw) return null
@@ -100,7 +116,14 @@ export function getUserByNickname(nickname) {
 }
 
 export function createUser(id, nickname, ipHash, fpHash) {
+  if (!isSafeKey(id)) return { error: 'bad-id' }
   const db = load()
+  // uniqueness inside the same critical section — no TOCTOU between check and write
+  // (single-threaded sync: nothing interleaves between load() and save()).
+  const lower = nickname.toLowerCase()
+  for (const raw of Object.values(db.users)) {
+    if (raw.nickname?.toLowerCase() === lower) return { error: 'taken' }
+  }
   const now = new Date().toISOString()
   db.users[id] = {
     id,
@@ -241,6 +264,7 @@ export function getRenameStatus(id) {
  * Returns { user, old, remaining, resetAtMs } or { error, resetAtMs? }.
  */
 export function renameUser(id, newNickname, { ipHash, fpHash }) {
+  if (!isSafeKey(id)) return { error: 'unknown' }
   const db = load()
   const raw = db.users[id]
   if (!raw) return { error: 'unknown' }
@@ -286,6 +310,64 @@ export function renameUser(id, newNickname, { ipHash, fpHash }) {
   }
 }
 
+/**
+ * Atomic tick: replay guard + min-interval guard + server-clock delta + credit,
+ * all inside ONE synchronous critical section (no awaits → nothing interleaves).
+ * Returns { user, credited, capped } or { error: 'unknown'|'replay'|'fast', totalMs }.
+ */
+export function creditTick(id, { seq, sessionId, ipHash, fpHash, heartbeatExpectMs, maxCreditMs, minTickMs, dailyCapMs }) {
+  if (!isSafeKey(id)) return { error: 'unknown' }
+  const db = load()
+  const raw = db.users[id]
+  if (!raw) return { error: 'unknown' }
+  const { user } = migrate(raw)
+  const now = Date.now()
+
+  if (seq <= (user.lastSeq || 0)) return { error: 'replay', totalMs: user.totalMs }
+  if (user.lastHeartbeatMs && now - user.lastHeartbeatMs < minTickMs) {
+    return { error: 'fast', totalMs: user.totalMs }
+  }
+
+  const elapsed = user.lastHeartbeatMs ? now - user.lastHeartbeatMs : heartbeatExpectMs
+  const delta = Math.max(0, Math.min(elapsed, maxCreditMs))
+
+  const today = todayStr()
+  if (user.dailyDate !== today) {
+    user.dailyDate = today
+    user.dailyMs = 0
+  }
+  user.lastSeq = seq
+  user.activeSessionId = sessionId
+  user.lastHeartbeatMs = now
+  user.lastSeen = new Date().toISOString()
+  if (ipHash && !user.ipHashes.includes(ipHash)) user.ipHashes.push(ipHash)
+  if (fpHash && !user.fpHashes.includes(fpHash)) user.fpHashes.push(fpHash)
+
+  let credited = delta
+  let capped = false
+  if (user.dailyMs + delta >= dailyCapMs) {
+    credited = Math.max(0, dailyCapMs - user.dailyMs)
+    capped = true
+    user.cappedDays += 1
+    if (!user.flags.includes('daily-cap')) user.flags.push('daily-cap')
+  }
+  user.dailyMs += credited
+  user.totalMs += credited
+  db.users[id] = user
+  save(db)
+  return { user, credited, capped }
+}
+
+/** GDPR purge: delete account + free the nickname. Returns true if existed. */
+export function deleteUser(id) {
+  if (!isSafeKey(id)) return false
+  const db = load()
+  if (!db.users[id]) return false
+  delete db.users[id]
+  save(db)
+  return true
+}
+
 /** Append-only audit trail for post-hoc cheat review (rotated past AUDIT_MAX_BYTES). */
 export function audit(entry) {
   try {
@@ -315,7 +397,7 @@ export function getLeaderboard(limit = 50) {
     .sort((a, b) => b.totalMs - a.totalMs)
     .slice(0, limit)
     .map(u => ({
-      id: u.id,
+      publicId: publicIdFor(u.id),
       nickname: u.nickname,
       totalMs: u.totalMs,
       // online if heartbeat within last 20s
