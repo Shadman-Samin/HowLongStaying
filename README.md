@@ -80,7 +80,7 @@ Client `deltaMs` is **ignored** — the server computes time from its own clock.
 | Forged `deltaMs=999999` | Server credits `min(now - lastTick, 6.5s)` only |
 | `curl` spam loop | Per-user 1 tick/2.5s + per-IP 15 ticks/10s sliding window |
 | Replay captured payload | Strictly-increasing `seq` per user; single-use challenge `nonce` on join/resume |
-| 10 tabs, same account | Concurrent-session guard: 2nd session/IP within 20s → `409 CONCURRENT` |
+| 10 tabs, same account | Concurrent-session guard: 2nd session within 20s → `409 CONCURRENT` (IP rotation allowed — dynamic IP/CGNAT/VPN keeps credit) |
 | 100 nicknames, 1 person | Max 5 nicks/IP/day + max 3 accounts/device fingerprint |
 | 24/7 bot | 16h/day hard cap + 4h session cap (human click to resume) |
 | Tab hidden / minimized / AFK | Client pauses (visibility + focus + 60s idle); server logs attestation |

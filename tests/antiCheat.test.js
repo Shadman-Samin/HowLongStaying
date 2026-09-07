@@ -33,6 +33,21 @@ function tick(sess, body = {}) {
   })
 }
 
+function tickFromIp(sess, ip, body = {}) {
+  return request(app).post('/api/tick').set('X-Forwarded-For', ip).send({
+    userId: sess.userId,
+    sessionId: sess.sessionId,
+    sessionToken: sess.sessionToken,
+    ...body
+  })
+}
+
+function joinFromIp(nickname, ip, extra = {}) {
+  return challenge().then(nonce =>
+    request(app).post('/api/join').set('X-Forwarded-For', ip).send({ nickname, nonce, ...extra })
+  )
+}
+
 beforeEach(async () => {
   const r = await request(app).post('/api/__reset')
   expect(r.status).toBe(200)
@@ -144,6 +159,43 @@ describe('tick auth + guards', () => {
     const other = await tick(j.body, { sessionId: '00000000-0000-0000-0000-000000000000', seq: 2 })
     // token is bound to the claimed session → wrong-session token is rejected first
     expect([401, 409]).toContain(other.status)
+  })
+
+  it('keeps credit across dynamic IP change on same session (no CONCURRENT)', async () => {
+    const j = await joinFromIp('dynamic_ip', '10.0.0.1')
+    expect(j.status).toBe(200)
+    const sess = j.body
+    await sleep(TICK_GAP)
+    const first = await tickFromIp(sess, '10.0.0.1', { seq: 1 })
+    expect(first.status).toBe(200)
+    await sleep(TICK_GAP)
+    // ISP rotates IP, same tab/session/token/seq-chain → must still credit
+    const rotated = await tickFromIp(sess, '10.0.0.2', { seq: 2 })
+    expect(rotated.status).toBe(200)
+    expect(rotated.body.code).toBeUndefined()
+    expect(rotated.body.totalMs).toBeGreaterThan(first.body.totalMs)
+    await sleep(TICK_GAP)
+    const rotatedAgain = await tickFromIp(sess, '10.0.0.3', { seq: 3 })
+    expect(rotatedAgain.status).toBe(200)
+    expect(rotatedAgain.body.totalMs).toBeGreaterThan(rotated.body.totalMs)
+  }, 20_000)
+
+  it('still rejects stale session after rejoin (true concurrent, 409 CONCURRENT)', async () => {
+    const j = await joinFromIp('two_tabs_ip', '10.0.0.1')
+    expect(j.status).toBe(200)
+    const oldSess = j.body
+    await sleep(TICK_GAP)
+    const first = await tickFromIp(oldSess, '10.0.0.1', { seq: 1 })
+    expect(first.status).toBe(200)
+    // second tab rejoins → rotates activeSessionId
+    const rej = await request(app).post('/api/join')
+      .set('X-Forwarded-For', '10.0.0.2')
+      .send({ nickname: '', userId: oldSess.userId, nonce: await challenge() })
+    expect(rej.status).toBe(200)
+    // old tab ticks again with its (valid-for-old-session) token → CONCURRENT
+    const stale = await tickFromIp(oldSess, '10.0.0.1', { seq: 2 })
+    expect(stale.status).toBe(409)
+    expect(stale.body.code).toBe('CONCURRENT')
   })
 
   it('rejects self-admitted inactive tabs (409 ATTEST, no credit)', async () => {

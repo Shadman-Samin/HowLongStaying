@@ -239,17 +239,23 @@ app.post(['/api/tick', '/api/heartbeat'], async (req, res) => {
 
   const now = Date.now()
 
-  // concurrent session guard: another session/ip ticking within ONLINE window
+  // concurrent session guard: another session ticking within ONLINE window.
+  // NOTE: IP is intentionally NOT part of this guard — dynamic IPs (mobile
+  // rotation, CGNAT, VPN reconnects) must not cost progress. Identity is
+  // sessionId + HMAC sessionToken + increasing seq. New IPs are adopted in
+  // creditTick() and kept in ipHashes[] for sybil review.
   const fresh = now - (user.lastHeartbeatMs || 0) < ONLINE_MS
   const sessionMismatch = user.activeSessionId && user.activeSessionId !== sessionId
-  const ipChanged = user.ipHashes.length > 0 && !user.ipHashes.includes(ip)
-  if (fresh && (sessionMismatch || ipChanged)) {
+  if (fresh && sessionMismatch) {
     await bumpConcurrent(userId)
     await audit({ kind: 'tick-reject', reason: 'concurrent', userId, sessionId, ip })
     return res.status(409).json({
       error: 'Another tab/device is tracking this account. Keep only ONE tab open.',
       code: 'CONCURRENT', totalMs: user.totalMs
     })
+  }
+  if (user.ipHashes.length > 0 && !user.ipHashes.includes(ip)) {
+    await audit({ kind: 'tick-ip-change', userId, sessionId, ip })
   }
 
   // session cap: >4h contiguous needs a human click to resume
